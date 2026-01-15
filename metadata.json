@@ -1,0 +1,5 @@
+{
+  "name": "Simulador de Taxas Pro",
+  "description": "Calculadora avançada para vendedores simularem empréstimos e taxas de máquinas de cartão com controle de margem de lucro.",
+  "requestFramePermissions": []
+}
