@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useState, useMemo } from 'react';
 import { 
   Calculator, 
   Settings as SettingsIcon, 
@@ -10,7 +10,7 @@ import {
   Percent,
   Banknote
 } from 'lucide-react';
-import { Rate, CalculationMode, CalculationResult } from './types';
+import { AppSettings, Rate, CalculationMode, CalculationResult } from './types';
 
 // --- Constants ---
 const DEFAULT_PROFIT_MARGIN = 4.5; // 4.5%
@@ -27,6 +27,130 @@ const INITIAL_RATES: Rate[] = [
   { parcelas: 15, taxa: 14.55 }, { parcelas: 16, taxa: 15.18 },
   { parcelas: 17, taxa: 15.81 }, { parcelas: 18, taxa: 16.43 }
 ];
+
+const SETTINGS_STORAGE_KEY = 'carlinapp-settings-v1';
+const UPDATE_TOKEN_STORAGE_KEY = 'carlinapp-update-token';
+
+const cloneRates = (rates: Rate[]): Rate[] => rates.map(rate => ({ ...rate }));
+
+const getInitialSettings = (): AppSettings => ({
+  rates: cloneRates(INITIAL_RATES),
+  profitMargin: DEFAULT_PROFIT_MARGIN,
+});
+
+const normalizeSettings = (value: unknown): AppSettings | null => {
+  if (!value || typeof value !== 'object') {
+    return null;
+  }
+
+  const parsed = value as Partial<AppSettings>;
+  const savedRates = Array.isArray(parsed.rates) ? parsed.rates : [];
+  const rates = INITIAL_RATES.map(defaultRate => {
+    const savedRate = savedRates.find(rate => rate?.parcelas === defaultRate.parcelas);
+    const taxa = Number(savedRate?.taxa);
+
+    return {
+      parcelas: defaultRate.parcelas,
+      taxa: Number.isFinite(taxa) && taxa >= 0 && taxa < 100 ? taxa : defaultRate.taxa,
+    };
+  });
+  const profitMargin = Number(parsed.profitMargin);
+
+  return {
+    rates,
+    profitMargin: Number.isFinite(profitMargin) && profitMargin >= 0
+      ? profitMargin
+      : DEFAULT_PROFIT_MARGIN,
+  };
+};
+
+const loadLocalSettings = (): AppSettings => {
+  const initialSettings = getInitialSettings();
+
+  if (typeof window === 'undefined') {
+    return initialSettings;
+  }
+
+  try {
+    const saved = window.localStorage.getItem(SETTINGS_STORAGE_KEY);
+    if (!saved) {
+      return initialSettings;
+    }
+
+    return normalizeSettings(JSON.parse(saved)) ?? initialSettings;
+  } catch {
+    return initialSettings;
+  }
+};
+
+const saveLocalSettings = (settings: AppSettings) => {
+  try {
+    window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // The calculator should continue working even if browser storage is unavailable.
+  }
+};
+
+const loadRemoteSettings = async (): Promise<AppSettings | null> => {
+  try {
+    const response = await fetch('/api/settings', { cache: 'no-store' });
+    if (!response.ok) {
+      return null;
+    }
+
+    const remoteSettings = await response.json();
+    return remoteSettings ? normalizeSettings(remoteSettings) : null;
+  } catch {
+    return null;
+  }
+};
+
+const saveRemoteSettings = async (
+  settings: AppSettings,
+  updateToken: string,
+): Promise<{ success: boolean; message: string }> => {
+  try {
+    const response = await fetch('/api/settings', {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Config-Token': updateToken,
+      },
+      body: JSON.stringify(settings),
+    });
+    const result = await response.json().catch(() => ({}));
+
+    if (!response.ok) {
+      return {
+        success: false,
+        message: result.error || 'Não foi possível salvar a configuração na Vercel.',
+      };
+    }
+
+    return { success: true, message: 'Configuração salva para todos os navegadores.' };
+  } catch {
+    return {
+      success: false,
+      message: 'Não foi possível conectar ao armazenamento remoto da Vercel.',
+    };
+  }
+};
+
+const loadUpdateToken = (): string => {
+  try {
+    return window.sessionStorage.getItem(UPDATE_TOKEN_STORAGE_KEY) ?? '';
+  } catch {
+    return '';
+  }
+};
+
+const saveUpdateToken = (token: string) => {
+  try {
+    window.sessionStorage.setItem(UPDATE_TOKEN_STORAGE_KEY, token);
+  } catch {
+    // The token is optional for reading and can be entered again if session storage is unavailable.
+  }
+};
 
 // --- Helpers ---
 const formatCurrency = (value: number) => {
@@ -46,13 +170,25 @@ const parseCurrency = (value: string): number => {
 interface SettingsProps {
   rates: Rate[];
   profitMargin: number;
-  onSave: (newRates: Rate[], newMargin: number) => void;
+  onSave: (
+    newRates: Rate[],
+    newMargin: number,
+    updateToken: string,
+  ) => Promise<{ success: boolean; message: string }>;
   onBack: () => void;
 }
 
-const SettingsScreen: React.FC<SettingsProps> = ({ rates, profitMargin, onSave, onBack }) => {
-  const [localRates, setLocalRates] = useState<Rate[]>(JSON.parse(JSON.stringify(rates)));
+const SettingsScreen: React.FC<SettingsProps> = ({
+  rates,
+  profitMargin,
+  onSave,
+  onBack,
+}) => {
+  const [localRates, setLocalRates] = useState<Rate[]>(cloneRates(rates));
   const [localMargin, setLocalMargin] = useState<string>(profitMargin.toString());
+  const [updateToken, setUpdateToken] = useState<string>(loadUpdateToken);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   const handleRateChange = (index: number, newVal: string) => {
     const updated = [...localRates];
@@ -60,8 +196,23 @@ const SettingsScreen: React.FC<SettingsProps> = ({ rates, profitMargin, onSave, 
     setLocalRates(updated);
   };
 
-  const handleSave = () => {
-    onSave(localRates, parseFloat(localMargin) || 0);
+  const handleSave = async () => {
+    setIsSaving(true);
+    setSaveError(null);
+
+    const result = await onSave(
+      localRates,
+      parseFloat(localMargin) || 0,
+      updateToken.trim(),
+    );
+
+    if (!result.success) {
+      setSaveError(result.message);
+    } else {
+      saveUpdateToken(updateToken.trim());
+    }
+
+    setIsSaving(false);
   };
 
   return (
@@ -94,6 +245,30 @@ const SettingsScreen: React.FC<SettingsProps> = ({ rates, profitMargin, onSave, 
           </p>
         </div>
 
+        <div className="bg-white rounded-xl shadow-sm p-4 mb-6">
+          <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4 flex items-center gap-2">
+            <Save size={16} /> Sincronização da Configuração
+          </h2>
+          <label className="block text-sm font-medium text-slate-700 mb-2" htmlFor="update-token">
+            Token de atualização da Vercel
+          </label>
+          <input
+            id="update-token"
+            type="password"
+            value={updateToken}
+            onChange={(e) => setUpdateToken(e.target.value)}
+            autoComplete="off"
+            className="w-full text-lg font-semibold border-b-2 border-slate-200 py-2 focus:border-royal-600 focus:outline-none bg-transparent text-slate-900"
+            placeholder="Informe o token para salvar"
+          />
+          <p className="text-xs text-slate-400 mt-2">
+            A leitura fica disponível para todos. O token é necessário somente para alterar a configuração global.
+          </p>
+          {saveError && (
+            <p className="text-sm text-red-600 mt-3">{saveError}</p>
+          )}
+        </div>
+
         <div className="bg-white rounded-xl shadow-sm overflow-hidden">
           <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide p-4 bg-slate-50 border-b border-slate-100 flex items-center gap-2">
             <Percent size={16} /> Taxas da Maquininha
@@ -120,10 +295,11 @@ const SettingsScreen: React.FC<SettingsProps> = ({ rates, profitMargin, onSave, 
       <div className="fixed bottom-0 left-0 right-0 p-4 bg-white border-t border-slate-200">
         <button 
           onClick={handleSave}
-          className="w-full bg-royal-600 text-white font-bold py-4 rounded-xl shadow-lg shadow-royal-200 active:scale-[0.98] transition-all flex items-center justify-center gap-2"
+          disabled={isSaving}
+          className="w-full bg-royal-600 text-white font-bold py-4 rounded-xl shadow-lg shadow-royal-200 active:scale-[0.98] transition-all flex items-center justify-center gap-2 disabled:opacity-60 disabled:cursor-wait"
         >
           <Save size={20} />
-          Salvar Alterações
+          {isSaving ? 'Salvando...' : 'Salvar Alterações'}
         </button>
       </div>
     </div>
@@ -133,9 +309,33 @@ const SettingsScreen: React.FC<SettingsProps> = ({ rates, profitMargin, onSave, 
 // --- Main Calculator ---
 
 const App: React.FC = () => {
+  const [initialSettings] = useState<AppSettings>(() => loadLocalSettings());
   const [view, setView] = useState<'calculator' | 'settings'>('calculator');
-  const [rates, setRates] = useState<Rate[]>(INITIAL_RATES);
-  const [profitMargin, setProfitMargin] = useState<number>(DEFAULT_PROFIT_MARGIN);
+  const [rates, setRates] = useState<Rate[]>(initialSettings.rates);
+  const [profitMargin, setProfitMargin] = useState<number>(initialSettings.profitMargin);
+  const [isRemoteSettingsLoading, setIsRemoteSettingsLoading] = useState(true);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    loadRemoteSettings().then(remoteSettings => {
+      if (!isMounted || !remoteSettings) {
+        return;
+      }
+
+      setRates(remoteSettings.rates);
+      setProfitMargin(remoteSettings.profitMargin);
+      saveLocalSettings(remoteSettings);
+    }).finally(() => {
+      if (isMounted) {
+        setIsRemoteSettingsLoading(false);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
 
   // Calculator State
   const [mode, setMode] = useState<CalculationMode>('borrow');
@@ -147,7 +347,7 @@ const App: React.FC = () => {
   // Logic Core
   const result: CalculationResult = useMemo(() => {
     const selectedRateObj = rates.find(r => r.parcelas === installments);
-    const ratePercent = selectedRateObj ? selectedRateObj.taxa : 0;
+    const ratePercent = selectedRateObj?.taxa ?? 0;
     const rateDecimal = ratePercent / 100;
     const marginDecimal = profitMargin / 100;
 
@@ -223,10 +423,21 @@ const App: React.FC = () => {
         rates={rates} 
         profitMargin={profitMargin} 
         onBack={() => setView('calculator')}
-        onSave={(newRates, newMargin) => {
-          setRates(newRates);
-          setProfitMargin(newMargin);
-          setView('calculator');
+        onSave={async (newRates, newMargin, updateToken) => {
+          const newSettings: AppSettings = {
+            rates: cloneRates(newRates),
+            profitMargin: newMargin,
+          };
+          const result = await saveRemoteSettings(newSettings, updateToken);
+
+          if (result.success) {
+            setRates(newSettings.rates);
+            setProfitMargin(newSettings.profitMargin);
+            saveLocalSettings(newSettings);
+            setView('calculator');
+          }
+
+          return result;
         }} 
       />
     );
@@ -245,7 +456,9 @@ const App: React.FC = () => {
           </div>
           <button 
             onClick={() => setView('settings')}
-            className="p-2 text-slate-400 hover:bg-slate-50 hover:text-royal-600 rounded-full transition-colors"
+            disabled={isRemoteSettingsLoading}
+            title={isRemoteSettingsLoading ? 'Carregando configuração salva' : 'Configurações'}
+            className="p-2 text-slate-400 hover:bg-slate-50 hover:text-royal-600 rounded-full transition-colors disabled:opacity-40 disabled:cursor-wait"
           >
             <SettingsIcon size={24} />
           </button>

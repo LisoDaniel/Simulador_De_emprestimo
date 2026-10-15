@@ -3,6 +3,11 @@ export interface Rate {
   taxa: number;
 }
 
+export interface AppSettings {
+  rates: Rate[];
+  profitMargin: number;
+}
+
 export interface CalculationResult {
   totalCharge: number; // Valor passado na maquininha
   clientReceives: number; // Valor na mão do cliente
